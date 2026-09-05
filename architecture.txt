@@ -1,0 +1,141 @@
+## 1. システムアーキテクチャ構成
+
+本システムは、大規模言語モデル（LLM）とベクトル検索（RAG: Retrieval-Augmented Generation）を組み合わせたWebアプリケーションとして構成します。
+
+| レイヤー | 採用技術・サービス | 役割・用途 |
+| --- | --- | --- |
+| **フロントエンド** | Next.js (TypeScript), Tailwind CSS | ユーザー操作画面、結果表示、Markdownプレビュー・PDF出力 |
+| **バックエンド API** | Python (FastAPI) | 非同期データ処理、外部API連携、AIパイプライン制御 |
+| **データベース** | PostgreSQL + pgvector (Supabase) | 構造化データ保存、ナレッジのベクトルストア管理 |
+| **外部データ連携** | EDINET API, Google Custom Search API, BeautifulSoup/Playwright | IR開示情報・ニュース・企業Webサイトの自動収集 |
+| **AI / LLM** | OpenAI API (GPT-4o) / Claude API, `text-embedding-3-large` | ナレッジ埋め込み作成、文章要約、相性判定・提案テキスト生成 |
+
+---
+
+## 2. データベース設計（主要テーブル）
+
+### ① `kesennuma_knowledge`（気仙沼市ナレッジDB）
+
+気仙沼市の強みや施策データをベクトル化して保持する構造です。
+
+```sql
+CREATE TABLE kesennuma_knowledge (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    category VARCHAR(50) NOT NULL, -- 例: 水産業, 観光, 再生エネ, 優遇制度, 地域課題
+    title VARCHAR(200) NOT NULL,
+    content TEXT NOT NULL,
+    metadata JSONB, -- 担当部署、最終更新日、関連リンク等
+    embedding VECTOR(3072), -- text-embedding-3-large 用ベクトル
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+```
+
+### ② `company_analysis`（企業分析・判定ログ）
+
+検索・分析した企業情報および診断結果を蓄積します。
+
+```sql
+CREATE TABLE company_analysis (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_code VARCHAR(20), -- 証券コード/法人番号
+    company_name VARCHAR(100) NOT NULL,
+    raw_ir_summary TEXT, -- 取得したIR・Webの抽出サマリー
+    affinity_score INT CHECK (affinity_score BETWEEN 1 AND 5), -- 1~5の相性スコア
+    match_reasons JSONB, -- マッチング根拠（箇条書き配列）
+    pitch_proposals JSONB, -- アプローチ訴求ポイント・提案文面
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+```
+
+---
+
+## 3. AI分析・RAG処理パイプライン設計
+
+```
+[1. 企業名入力] ➔ [2. 外部情報収集] ➔ [3. ナレッジ照合(RAG)] ➔ [4. AI判定・提案生成] ➔ [5. UI出力]
+
+```
+
+1. **情報収集モジュール**:
+* **IR情報**: EDINET APIから直近有価証券報告書の「事業の状況」「対処すべき課題」「サステナビリティ推進」テキストを抽出。
+* **Web/ニュース**: 企業HPの「事業内容」「ニュースリリース」およびGoogle Custom Searchより「[企業名] 地方創生」「[企業名] 実証実験」等の最新情報を取得。
+
+
+2. **ベクトル検索 (RAG)**:
+* 収集した企業データを入力テキストとしてベクトル化し、`kesennuma_knowledge` とコサイン類似度検索を実行。相性の高い気仙沼市のアセット/課題を上位3〜5件抽出。
+
+
+3. **LLM推論プロンプト処理**:
+* 抽出した「企業データ」と「気仙沼市アセット」をプロンプトに組み込み、以下を出力フォーマット（JSON）で指定。
+* `affinity_score`: 1〜5の数値
+* `key_synergies`: 親和性の根拠（例：「企業の魚食DX技術」×「気仙沼の水産加工基盤」）
+* `approach_letter`: 企業宛のアプローチ文面（1000文字程度）
+* `executive_summary`: 庁内共有用サマリー（Markdown）
+
+
+
+
+
+---
+
+## 4. API インターフェース設計
+
+### `POST /api/v1/analysis/company`
+
+指名企業情報を取得し、相性判定を実施する主要エンドポイントです。
+
+* **Request Body**:
+```json
+{
+  "company_name": "株式会社水産テクノロジー",
+  "stock_code": "9999", 
+  "force_refresh": false
+}
+
+```
+
+
+* **Response Body**:
+```json
+{
+  "company_name": "株式会社水産テクノロジー",
+  "affinity_score": 5,
+  "key_synergies": [
+    "同社の自動冷凍保管システムは、気仙沼市の水産加工団地における人手不足解消に直結する",
+    "脱炭素化目標（2030年）に対し、気仙沼市の未利用バイオマス資源活用が合致する"
+  ],
+  "proposal_draft": {
+    "subject": "【気仙沼市より】水産加工DXおよび省エネ技術に関する官民連携のご提案",
+    "body": "株式会社水産テクノロジー 経営企画部御中\n\n気仙沼市 企業誘致課の...（略）"
+  },
+  "matched_city_assets": ["水産加工集積地区施設", "再生可能エネルギー補助制度"]
+}
+
+```
+
+
+
+---
+
+## 5. 画面構成・UI設計
+
+* **ダッシュボード / 検索画面**:
+* メイン検索窓（社名・コード入力）および「直近分析した企業」のカード一覧。
+* フェーズ3向け「領域指定（水産×DXなど）でアタック候補を検索」切り替えタブ。
+
+
+* **分析結果・提案生成画面**:
+* **左カラム（要約・スコア）**: 5段階スコア表示、企業概要、親和性の高い根拠リスト。
+* **右カラム（提案作成）**: 生成されたアプローチメール・提案サマリーのリアルタイム編集エディタ（ワンクリックコピー、PDF/Markdown出力ボタン配置）。
+
+
+* **気仙沼市ナレッジ管理画面**:
+* 市の強み・課題・制度の追加/編集（CSV一括インポート対応）。
+
+
+
+---
+
+フェーズ1の実装に向けて、外部情報の収集対象は「EDINET（上場企業のIR）」と「Googleニュース（一般Web記事）」のどちらを最優先で接続テストしますか？
